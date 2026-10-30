@@ -104,14 +104,39 @@ func stripeMeterEventDispatch(ctx context.Context, in stripeMeterEvent) (string,
 // propagated — a poison-pill row should not block the rest of the
 // queue.
 func (m *MeteredBillingSyncer) RunOnce(ctx context.Context, limit int) (pushed int) {
+	pushed, _ = m.pass(ctx, limit)
+	return pushed
+}
+
+// drain runs passes until the queue is empty. One pass a tick sent at
+// most 200 events every five minutes: a product recording usage faster
+// than that fell further behind on every tick, and usage that reaches
+// Stripe after the invoice for its period is finalized (an hour after
+// the period ends, by default) is never billed. A pass that fails a row
+// ends the drain, so the next tick retries it rather than this one
+// spending its attempts back to back.
+func (m *MeteredBillingSyncer) drain(ctx context.Context, limit int) (pushed int) {
+	for {
+		n, more := m.pass(ctx, limit)
+		pushed += n
+		if !more || ctx.Err() != nil {
+			return pushed
+		}
+	}
+}
+
+// pass is RunOnce. more reports a full batch with no row failed: the
+// queue may hold more behind it.
+func (m *MeteredBillingSyncer) pass(ctx context.Context, limit int) (pushed int, more bool) {
 	if limit <= 0 {
 		limit = 100
 	}
 	rows, err := m.store.ListUnsyncedMetered(ctx, limit, m.maxAttempts)
 	if err != nil {
 		m.logger.Error("metered: list unsynced failed", "error", err)
-		return 0
+		return 0, false
 	}
+	failed := false
 	for _, row := range rows {
 		if row.Attempts >= m.maxAttempts {
 			// Hit the ceiling. Don't keep retrying forever; admin
@@ -129,13 +154,14 @@ func (m *MeteredBillingSyncer) RunOnce(ctx context.Context, limit int) (pushed i
 			// does NOT touch attempts; RecordMeteredSyncFailure
 			// owns it. Without this split the counter doubled.
 			_ = m.store.RecordMeteredSyncFailure(ctx, row.ID, err.Error())
+			failed = true
 			continue
 		}
 		if sent {
 			pushed++
 		}
 	}
-	return pushed
+	return pushed, len(rows) == limit && !failed
 }
 
 // syncOne pushes a single event. Returns (sent, err):
@@ -225,7 +251,7 @@ func classifyStripeError(err error) error {
 	return fmt.Errorf("stripe: %s", msg)
 }
 
-// StartSyncLoop runs RunOnce on a fixed interval. interval should
+// StartSyncLoop drains the queue on a fixed interval. interval should
 // be in minutes-scale; sub-minute polling burns Stripe rate budget
 // for no real benefit (Stripe aggregates server-side anyway).
 func (m *MeteredBillingSyncer) StartSyncLoop(ctx context.Context, interval time.Duration) {
@@ -234,7 +260,7 @@ func (m *MeteredBillingSyncer) StartSyncLoop(ctx context.Context, interval time.
 	}
 	// Initial drain on boot — picks up anything queued during the
 	// last shutdown window.
-	m.RunOnce(ctx, 200)
+	m.drain(ctx, 200)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -243,7 +269,7 @@ func (m *MeteredBillingSyncer) StartSyncLoop(ctx context.Context, interval time.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.RunOnce(ctx, 200)
+			m.drain(ctx, 200)
 		}
 	}
 }

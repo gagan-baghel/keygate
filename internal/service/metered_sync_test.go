@@ -321,3 +321,74 @@ func TestMeteredSync_DeadRowsDoNotStarveTheBatch(t *testing.T) {
 		t.Fatalf("limit 2 with 2 dead rows ahead: pushed %d, want 1 (the live row)", pushed)
 	}
 }
+
+// The loop sends everything queued, not one batch of it. One pass a
+// tick held the sync to 200 events every five minutes, so a backlog
+// built up, and usage that reaches Stripe after its invoice is
+// finalized is never billed.
+func TestMeteredSync_LoopSendsTheWholeQueue(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	lic, _ := seedMeteredLicense(t, tt.store, ctx, "api_calls_meter", "cus_TEST_backlog")
+	const queued = 201 // one more than a pass takes
+	for range queued {
+		if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-10", 1); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		tt.syncer.StartSyncLoop(loopCtx, time.Hour) // no tick: the pass on start is all there is
+		close(done)
+	}()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var left int
+		if err := tt.store.DB.NewRaw("SELECT count(*) FROM metered_billing WHERE license_id = ? AND synced = false", lic.ID).Scan(ctx, &left); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if left == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d events still waiting after the loop's pass on start", left, queued)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// A pass that fails a row ends the drain: the row waits for the next
+// tick instead of spending its attempts back to back while Stripe is
+// down.
+func TestMeteredSync_DrainStopsOnFailure(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	lic, _ := seedMeteredLicense(t, tt.store, ctx, "api_calls_meter", "cus_TEST_drain_fail")
+	for range 3 {
+		if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-10", 1); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	tt.failNext = errors.New("stripe: connection refused")
+	if pushed := tt.syncer.drain(ctx, 2); pushed != 1 {
+		t.Fatalf("pushed %d, want 1: the drain should stop after the batch with the failure", pushed)
+	}
+	rows, _ := tt.store.ListMeteredBilling(ctx, lic.ID)
+	unsynced, attempts := 0, 0
+	for _, r := range rows {
+		if !r.Synced {
+			unsynced++
+			attempts += r.Attempts
+		}
+	}
+	if unsynced != 2 || attempts != 1 {
+		t.Fatalf("unsynced=%d attempts=%d, want 2 rows left with one attempt spent", unsynced, attempts)
+	}
+
+	if pushed := tt.syncer.drain(ctx, 2); pushed != 2 {
+		t.Fatalf("next drain pushed %d, want the 2 left", pushed)
+	}
+}
