@@ -468,13 +468,22 @@ func (s *Store) TakeSnapshot(ctx context.Context, productID string, date time.Ti
 	return s.CreateAnalyticsSnapshot(ctx, snap)
 }
 
-func (s *Store) TakeAllSnapshots(ctx context.Context, date time.Time) error {
-	products, _, err := s.ListProducts(ctx, "", nil, All)
-	if err != nil {
+// TakeMissingSnapshots takes date's snapshot for each product that has
+// none for that day yet and existed by its end. A snapshot already taken
+// is kept, so the job can run at startup and every hour: a server that
+// restarts, as an upgrade does, still records each day once, and never
+// writes over a day with later numbers.
+func (s *Store) TakeMissingSnapshots(ctx context.Context, date time.Time) error {
+	day := date.Truncate(24 * time.Hour)
+	var ids []string
+	if err := s.DB.NewSelect().TableExpr("products AS p").ColumnExpr("p.id").
+		Where("p.created_at < ?", day.Add(24*time.Hour)).
+		Where("NOT EXISTS (SELECT 1 FROM analytics_snapshots AS a WHERE a.product_id = p.id AND a.date = ?)", day).
+		Scan(ctx, &ids); err != nil {
 		return err
 	}
-	for _, p := range products {
-		if err := s.TakeSnapshot(ctx, p.ID, date); err != nil {
+	for _, id := range ids {
+		if err := s.TakeSnapshot(ctx, id, date); err != nil {
 			return err
 		}
 	}

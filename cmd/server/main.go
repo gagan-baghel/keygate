@@ -564,17 +564,26 @@ func main() {
 		}()
 	}
 
+	// Yesterday's analytics snapshot, taken at startup and checked every
+	// hour for any product still without one. Waiting a full day of
+	// uptime for the first one meant a server restarted more often than
+	// that, as an upgrade does, took none, and the analytics charts
+	// stayed empty.
 	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
+		snapshot := func() {
+			if err := db.TakeMissingSnapshots(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
+				logger.Error("analytics snapshot failed", "error", err)
+			}
+		}
+		snapshot()
+		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := db.TakeAllSnapshots(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
-					logger.Error("analytics snapshot failed", "error", err)
-				}
+				snapshot()
 			}
 		}
 	}()
